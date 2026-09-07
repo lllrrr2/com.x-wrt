@@ -79,6 +79,13 @@ fi
 	exit 0
 }
 
+mwan3_get_iface_id iface_id "$INTERFACE"
+[ -n "$iface_id" ] || {
+	[ "$MWAN3_STARTUP" != 1 ] && mwan3_unlock "$ACTION" "$INTERFACE"
+	LOG warn "mwan3 hotplug on $INTERFACE not called because interface index exceeds max $MWAN3_INTERFACE_MAX"
+	exit 0
+}
+
 familys="$FAMILY"
 if [ "$familys" != "ipv4" ] && [ "$familys" != "ipv6" ]; then
 	config_get familys "$INTERFACE" family "any"

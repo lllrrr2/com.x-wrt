@@ -24,6 +24,7 @@ IPv6_REGEX="${IPv6_REGEX}fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|"
 IPv6_REGEX="${IPv6_REGEX}::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|"
 IPv6_REGEX="${IPv6_REGEX}([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])"
 
+MWAN3_INTERFACE_HARD_MAX=250
 MWAN3_INTERFACE_MAX=""
 DEFAULT_LOWEST_METRIC=256
 MMX_MASK=""
@@ -41,9 +42,11 @@ NEED_IPV6=0
 
 mwan3_init_post()
 {
-	local enabled family
+	local _tid enabled family
 	check_family()
 	{
+		let _tid++
+		[ "$_tid" -gt "$MWAN3_INTERFACE_MAX" ] && return
 		config_get enabled "$1" enabled 0
 		config_get family "$1" family "any"
 
@@ -78,27 +81,112 @@ mwan3_ip6tables_nat_delete_rule()
 	ip6tables -t nat -D $stripped
 }
 
+mwan3_set_ipv6_native()
+{
+	local entries entry other_entry iface prefix other_iface other_prefix
+	local conflict old_ifs temp_set _tid
+
+	[ $NEED_IPV6 -ne 0 ] || return
+	entries=
+	_tid=0
+	temp_set="mwan3_native_v6_tmp_$$"
+
+	$IPS -! create mwan3_native_v6 hash:net hashsize 128 family inet6
+	$IPS destroy "$temp_set" &>/dev/null
+	$IPS create "$temp_set" hash:net hashsize 128 family inet6 || {
+		LOG error "failed to create $temp_set"
+		return 1
+	}
+
+	mwan3_collect_ipv6_native()
+	{
+		local family enabled setname prefixes prefix
+
+		_tid=$((_tid + 1))
+		[ "$_tid" -gt "$MWAN3_INTERFACE_MAX" ] && return
+		config_get enabled "$1" enabled 0
+		config_get family "$1" family "any"
+		[ "$enabled" = "1" ] || return
+		[ "$family" = "ipv6" ] || [ "$family" = "any" ] || return
+
+		setname="mwan3_${1}_ipv6_src_from"
+		$IPS list -n "$setname" &>/dev/null || return
+		prefixes="$($IPS save "$setname" 2>/dev/null | awk -v setname="$setname" \
+			'$1 == "add" && $2 == setname { print $3 }')"
+		for prefix in $prefixes; do
+			entries="$entries
+$1 $prefix"
+		done
+	}
+	config_foreach mwan3_collect_ipv6_native interface
+
+	old_ifs="$IFS"
+	IFS='
+'
+	for entry in $entries; do
+		[ -n "$entry" ] || continue
+		iface=${entry%% *}
+		prefix=${entry#* }
+		conflict=0
+
+		for other_entry in $entries; do
+			[ -n "$other_entry" ] || continue
+			other_iface=${other_entry%% *}
+			other_prefix=${other_entry#* }
+			[ "$iface" = "$other_iface" ] && continue
+
+			# Two CIDRs overlap when either network address belongs to the other set.
+			if $IPS -q test "mwan3_${other_iface}_ipv6_src_from" "${prefix%/*}" ||
+				$IPS -q test "mwan3_${iface}_ipv6_src_from" "${other_prefix%/*}"; then
+				conflict=1
+				break
+			fi
+		done
+
+		if [ $conflict -eq 0 ]; then
+			$IPS -! add "$temp_set" "$prefix"
+		else
+			LOG notice "IPv6 source prefix $prefix on $iface overlaps another WAN; keeping mwan3 policy selection"
+		fi
+	done
+	IFS="$old_ifs"
+
+	$IPS swap "$temp_set" mwan3_native_v6 || {
+		LOG error "failed to update mwan3_native_v6"
+		$IPS destroy "$temp_set" &>/dev/null
+		return 1
+	}
+	$IPS destroy "$temp_set" &>/dev/null
+}
+
 mwan3_ipv6_masq_help()
 {
-	local family enabled
+	local family enabled setname prefixes prefix
 
 	config_get enabled "$INTERFACE" enabled 0
 	config_get family "$INTERFACE" family "any"
 	[ "$enabled" = "1" ] || return
 	[ "$family" = "ipv6" ] || [ "$family" = "any" ] || return
+	setname="mwan3_${INTERFACE}_ipv6_src_from"
 
 	ip6tables -t nat -S POSTROUTING 2>/dev/null | awk -v tag="masq-help-${INTERFACE}-dev" \
 		'$0 ~ tag { sub(/^-A /, ""); print }' | while read line; do
 		mwan3_ip6tables_nat_delete_rule "$line"
-		$IPS destroy mwan3_${INTERFACE}_ipv6_src_from &>/dev/null
 	done
+	$IPS destroy "$setname" &>/dev/null
 
 	LOG debug "mwan3_ipv6_masq_help stage1 on INTERFACE=$INTERFACE DEVICE=$DEVICE ACTION=$ACTION"
 
-	[ "$ACTION" = "ifup" ] || return
+	if [ "$ACTION" != "ifup" ]; then
+		[ "$MWAN3_STARTUP" = "1" ] || mwan3_set_ipv6_native
+		return
+	fi
 
-	$IPS destroy mwan3_${INTERFACE}_ipv6_src_from &>/dev/null
-	$IP6 route list dev "$DEVICE" table main | awk -v device="$DEVICE" '
+	$IPS create "$setname" hash:net hashsize 128 family inet6 || {
+		LOG error "failed to create $setname"
+		return 1
+	}
+	prefixes="$($IP6 route list dev "$DEVICE" table main | awk '
 		($1 == "default" || $1 == "::/0") {
 			from = ""
 			for (i = 1; i <= NF; i++) {
@@ -107,18 +195,17 @@ mwan3_ipv6_masq_help()
 					break
 				}
 			}
-			if (from != "") print from, device
+			if (from != "" && from != "all" && from != "::/0") print from
 		}
-	' | while read from dev; do
-		$IPS list -n mwan3_${INTERFACE}_ipv6_src_from &>/dev/null || $IPS create mwan3_${INTERFACE}_ipv6_src_from hash:net hashsize 128 family inet6
-		$IPS add mwan3_${INTERFACE}_ipv6_src_from $from
+	')"
+	for prefix in $prefixes; do
+		$IPS -! add "$setname" "$prefix"
 	done
 
-	if $IPS list -n mwan3_${INTERFACE}_ipv6_src_from &>/dev/null; then
-		ip6tables -t nat -A POSTROUTING -m set ! --match-set mwan3_${INTERFACE}_ipv6_src_from src -o ${DEVICE} -m comment --comment "masq-help-${INTERFACE}-dev" -j MASQUERADE
-	else
-		LOG notice "mwan3_ipv6_masq_help stage2 on INTERFACE=$INTERFACE DEVICE=$DEVICE ACTION=$ACTION no masq set"
-	fi
+	ip6tables -t nat -A POSTROUTING -m set ! --match-set "$setname" src -o "$DEVICE" -m comment --comment "masq-help-${INTERFACE}-dev" -j MASQUERADE ||
+		LOG error "failed to install IPv6 masquerade helper for $INTERFACE on $DEVICE"
+
+	[ "$MWAN3_STARTUP" = "1" ] || mwan3_set_ipv6_native
 
 	LOG debug "mwan3_ipv6_masq_help stage2 on INTERFACE=$INTERFACE DEVICE=$DEVICE ACTION=$ACTION"
 }
@@ -131,6 +218,10 @@ mwan3_ipv6_masq_cleanup()
 	$IPS list -n | awk '/mwan3_.*_ipv6_src_from/' | while read line; do
 		$IPS destroy $line &>/dev/null
 	done
+	$IPS list -n | awk '/^mwan3_native_v6_tmp_[0-9]+$/' | while read line; do
+		$IPS destroy "$line" &>/dev/null
+	done
+	$IPS destroy mwan3_native_v6 &>/dev/null
 }
 
 mwan3_push_update()
@@ -154,6 +245,7 @@ mwan3_update_dev_to_table()
 	{
 		local family family_list curr_table device enabled
 		let _tid++
+		[ "$_tid" -gt "$MWAN3_INTERFACE_MAX" ] && return
 		config_get family_list "$1" family "any"
 		network_get_device device "$1"
 		[ -z "$device" ] && return
@@ -178,6 +270,7 @@ mwan3_update_iface_to_table()
 	update_table()
 	{
 		let _tid++
+		[ "$_tid" -gt "$MWAN3_INTERFACE_MAX" ] && return
 		export mwan3_iface_tbl="${mwan3_iface_tbl}${1}=$_tid "
 	}
 	config_foreach update_table interface
@@ -264,6 +357,15 @@ mwan3_id2mask()
 	printf "0x%x" $result
 }
 
+mwan3_limit_iface_max()
+{
+	if [ "$MWAN3_INTERFACE_MAX" -gt "$MWAN3_INTERFACE_HARD_MAX" ] 2>/dev/null; then
+		LOG warn "Max interface count ${MWAN3_INTERFACE_MAX} exceeds package limit ${MWAN3_INTERFACE_HARD_MAX}; capping"
+		MWAN3_INTERFACE_MAX=$MWAN3_INTERFACE_HARD_MAX
+	fi
+	uci_toggle_state mwan3 globals iface_max "$MWAN3_INTERFACE_MAX"
+}
+
 mwan3_init()
 {
 	local bitcnt
@@ -275,6 +377,11 @@ mwan3_init()
 	if [ -e "${MWAN3_STATUS_DIR}/mmx_mask" ]; then
 		readfile MMX_MASK "${MWAN3_STATUS_DIR}/mmx_mask"
 		MWAN3_INTERFACE_MAX=$(uci_get_state mwan3 globals iface_max)
+		if [ -z "$MWAN3_INTERFACE_MAX" ]; then
+			bitcnt=$(mwan3_count_one_bits MMX_MASK)
+			mmdefault=$(((1<<bitcnt)-1))
+			MWAN3_INTERFACE_MAX=$((mmdefault-3))
+		fi
 	else
 		config_load mwan3
 		config_get MMX_MASK globals mmx_mask '0x3F00'
@@ -284,9 +391,9 @@ mwan3_init()
 		bitcnt=$(mwan3_count_one_bits MMX_MASK)
 		mmdefault=$(((1<<bitcnt)-1))
 		MWAN3_INTERFACE_MAX=$((mmdefault-3))
-		uci_toggle_state mwan3 globals iface_max "$MWAN3_INTERFACE_MAX"
-		LOG debug "Max interface count is ${MWAN3_INTERFACE_MAX}"
 	fi
+	mwan3_limit_iface_max
+	LOG debug "Max interface count is ${MWAN3_INTERFACE_MAX}"
 
 	# mark mask constants
 	bitcnt=$(mwan3_count_one_bits MMX_MASK)
@@ -348,6 +455,9 @@ mwan3_get_iface_id()
 	[ -z "$mwan3_iface_tbl" ] && mwan3_update_iface_to_table
 	_tmp="${mwan3_iface_tbl##* ${2}=}"
 	_tmp=${_tmp%% *}
+	if [ -n "$_tmp" ] && [ "$_tmp" -gt "$MWAN3_INTERFACE_MAX" ] 2>/dev/null; then
+		_tmp=
+	fi
 	export "$1=$_tmp"
 }
 
@@ -501,6 +611,9 @@ mwan3_set_general_iptables()
 		[ "$IPT" = "$IPT6" ] && [ $NEED_IPV6 -eq 0 ] && continue
 		current="$($IPT -S 2>/dev/null)"$'\n'
 		update="*mangle"
+		if [ "$IPT" = "$IPT6" ]; then
+			$IPS -! create mwan3_native_v6 hash:net hashsize 128 family inet6
+		fi
 		if [ -n "${current##*-N mwan3_ifaces_in*}" ]; then
 			mwan3_push_update -N mwan3_ifaces_in
 		fi
@@ -568,6 +681,12 @@ mwan3_set_general_iptables()
 			mwan3_push_update -A mwan3_hook \
 					  -m mark --mark 0x0/$MMX_MASK \
 					  -j mwan3_local
+			if [ "$IPT" = "$IPT6" ]; then
+				mwan3_push_update -A mwan3_hook \
+						  -m mark --mark 0x0/$MMX_MASK \
+						  -m set --match-set mwan3_native_v6 src \
+						  -j MARK --set-xmark $MMX_DEFAULT/$MMX_MASK
+			fi
 			mwan3_push_update -A mwan3_hook \
 					  -m mark --mark 0x0/$MMX_MASK \
 					  -j mwan3_rules
@@ -765,6 +884,7 @@ mwan3_add_all_nondefault_routes()
 	add_active_tbls()
 	{
 		let tid++
+		[ "$tid" -gt "$MWAN3_INTERFACE_MAX" ] && return
 		config_get family "$1" family "any"
 		[ "$family" != "$ipv" ] && [ "$family" != "any" ] && return
 		$IP route list table $tid 2>/dev/null | grep -q "^default\|^::/0" && {
@@ -775,6 +895,7 @@ mwan3_add_all_nondefault_routes()
 	add_route()
 	{
 		let id++
+		[ "$id" -gt "$MWAN3_INTERFACE_MAX" ] && return
 		[ -n "${active_tbls##* $id *}" ] && return
 		[ -n "${route_line##* expires *}" ] || route_line="${route_line%expires *}${route_line#* expires * }"
 		[ "$tid" != "$id" ] && [ -z "${route_line##* scope link*}" ] && \
@@ -914,8 +1035,11 @@ mwan3_rtmon()
 
 mwan3_track()
 {
-	local track_ips pids
+	local id track_ips pids
 	local track_ips_v4 track_ips_v6
+
+	mwan3_get_iface_id id "$1"
+	[ -n "$id" ] || return 0
 
 	mwan3_list_track_ips()
 	{
