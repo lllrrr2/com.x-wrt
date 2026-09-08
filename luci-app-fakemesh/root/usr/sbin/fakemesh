@@ -379,6 +379,34 @@ agent_lost_ac()
 	lost_ac=$lost_ac exec /usr/sbin/fakemesh agent_sync_config &
 }
 
+controller_addresses()
+(
+	. /usr/share/libubox/jshn.sh
+	json_load "$(ubus call umdns browse)" || exit 1
+	json_select "_fakemesh_${Xid}._tcp" || exit 1
+	json_get_keys services
+	for service in $services; do
+		json_select "$service" || continue
+		json_get_var address ipv4
+		[ -z "$address" ] || printf '%s\n' "$address"
+		json_select ..
+	done
+)
+
+controller_announcement()
+(
+	. /usr/share/libubox/jshn.sh
+	json_init
+	json_add_object fakemesh
+	json_add_string service "_fakemesh_${Xid}._tcp.local"
+	json_add_int port 65535
+	json_add_array txt
+	json_add_string '' "id=${Xid}"
+	json_close_array
+	json_close_object
+	json_dump
+)
+
 wireless_config_md5()
 {
 	{
@@ -465,7 +493,7 @@ agent_sync_config()
 				/etc/init.d/umdns reload
 				sleep 5
 			fi
-			achost="$(ubus call umdns browse | jsonfilter -e "@['_fakemesh_${Xid}._tcp'][*]['ipv4']")"
+			achost=$(controller_addresses)
 			if ! test -n "$achost"; then
 				logger -t fakemesh "agent_sync_config($pid): umdns: achost not found(lost_ac=$lost_ac)!"
 				achost=controller.fakemesh
@@ -770,7 +798,7 @@ agent_fix_channel()
 		sleep 10
 		sta="$(ubus -S list wpa_supplicant.meshx1)"
 		if test -n "$sta"; then
-			chan=$(iwinfo meshx1 scan | grep -A1 -B1 "ESSID: \"${Xid}\"" | head -n3 | tail -n1 | grep -io "Channel:.*"| awk '{print $2}')
+			chan=$(iwinfo meshx1 scan | grep -F -A1 -B1 "ESSID: \"${Xid}\"" | head -n3 | tail -n1 | grep -io "Channel:.*"| awk '{print $2}')
 			if test -n "$chan"; then
 				if [ "$chan" != "$channel" ]; then
 					logger -t fakemesh "agent_fix_channel($pid): Setting up channel ($chan) for ${radio}"
@@ -881,15 +909,9 @@ if [ "$role" = "controller" ]; then
 	test -e /etc/init.d/umdns && {
 	mkdir -p /etc/umdns
 	ln -s /tmp/fakemesh.umdns.json /etc/umdns 2>/dev/null
-	umdns_json="{
-	\"fakemesh\": {
-		\"service\": \"_fakemesh_${Xid}._tcp.local\",
-		\"port\": 65535,
-		\"txt\": [ \"id=${Xid}\" ]
-	}
-}"
+	umdns_json=$(controller_announcement) || exit 1
 	[ "$(md5sum /tmp/fakemesh.umdns.json 2>/dev/null | head -c32)" = "$(echo "$umdns_json" | md5sum | head -c32)" ] || {
-	echo "$umdns_json" >/tmp/fakemesh.umdns.json
+	printf '%s\n' "$umdns_json" >/tmp/fakemesh.umdns.json
 	/etc/init.d/umdns restart
 	}
 	}
