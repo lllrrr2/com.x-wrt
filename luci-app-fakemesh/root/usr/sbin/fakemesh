@@ -278,6 +278,53 @@ agent_lost_ac()
 	lost_ac=$lost_ac exec /usr/sbin/fakemesh agent_sync_config &
 }
 
+validate_ac_config()
+(
+	validate_dir="/tmp/fakemesh-validate.$$"
+	mkdir -m 700 "$validate_dir" || exit 1
+	trap 'rm -rf "$validate_dir"' EXIT
+	cp "$1" "$validate_dir/fakemeshac" || exit 1
+
+	# Parse independently of the live config and any pending UCI changes.
+	config_dump=$(uci -q -c "$validate_dir" -P "$validate_dir" show fakemeshac) || exit 1
+	ac_get() {
+		uci -q -c "$validate_dir" -P "$validate_dir" get "$1"
+	}
+	[ "$(ac_get fakemeshac.default)" = "fakemesh" ] || exit 1
+	[ "$(ac_get fakemeshac.default.role)" = "controller" ] || exit 1
+	[ "$(ac_get fakemeshac.default.enabled)" = "1" ] || exit 1
+	mesh_id=$(ac_get fakemeshac.default.id)
+	[ -n "$mesh_id" ] && [ "${#mesh_id}" -le 32 ] || exit 1
+	case "$(ac_get fakemeshac.default.band)" in
+		2g|5g|6g) ;;
+		*) exit 1 ;;
+	esac
+
+	# An explicitly empty wireless catalog is valid, but malformed entries are not.
+	sections=$(printf '%s\n' "$config_dump" | sed -n 's/^\(fakemeshac\.[^.]*\)=wifim$/\1/p')
+	for section in $sections; do
+		ssid=$(ac_get "$section.ssid")
+		[ -n "$ssid" ] && [ "${#ssid}" -le 32 ] || exit 1
+		case "$(ac_get "$section.band")" in
+			2g|5g|6g|2g5g|2g6g|5g6g|2g5g6g) ;;
+			*) exit 1 ;;
+		esac
+		case "$(ac_get "$section.enabled" || printf 1)" in
+			0|1) ;;
+			*) exit 1 ;;
+		esac
+		case "$(ac_get "$section.encryption")" in
+			none|owe) ;;
+			psk|psk2|psk-mixed|sae|sae-mixed)
+				key=$(ac_get "$section.key")
+				[ -n "$key" ] || exit 1
+				;;
+			*) exit 1 ;;
+		esac
+	done
+	exit 0
+)
+
 agent_sync_config()
 {
 	[ "$sync_ac" = "1" ] || {
@@ -361,8 +408,15 @@ agent_sync_config()
 			fi
 		fi
 
-		if ! grep -q fakemesh /tmp/fakemesh.ac.config.tmp; then
+		if ! validate_ac_config /tmp/fakemesh.ac.config.tmp; then
+			lost_ac=$((lost_ac+1))
+			logger -t fakemesh "agent_sync_config($pid): invalid controller config ($lost_ac), keeping current config"
 			rm -f /tmp/fakemesh.ac.config.tmp
+			if [ "$role" != "controller" ] && test "$lost_ac" -ge "$LOST_AC_CNT"; then
+				lost_ac=$lost_ac exec /usr/sbin/fakemesh agent_lost_ac &
+				return 0
+			fi
+			sleep 30
 			test -f /tmp/fakemesh_lck3/$pid || return 0
 			continue
 		fi
